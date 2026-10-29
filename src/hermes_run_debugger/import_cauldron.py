@@ -139,6 +139,8 @@ def _read(path: Path, limits: StreamLimits, remaining: int) -> tuple[dict[str, A
 
 def _shape(path: Path, record: dict[str, Any]) -> str:
     schema = record.get("schema")
+    if schema is not None and not isinstance(schema, str):
+        _refuse("shape", "receipt schema must be a string or null")
     for key in ("ok", "scored", "partial", "cleanup_ok", "manual_required", "execution_uncertain"):
         _boolean(record, key)
     if schema == _RELEASE:
