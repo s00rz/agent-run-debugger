@@ -69,9 +69,75 @@ class _AmbiguityIndex:
         return related
 
     def count(self, event_id: str) -> int:
-        if event_id not in self.counts:
-            self.counts[event_id] = len(self.ordered) - len(self.related(event_id))
+        if not self.counts:
+            self._count_all()
         return self.counts[event_id]
+
+    def _count_all(self) -> None:
+        # Components have no paths between them. Keep bit positions local so a
+        # small fork/join beside a long chain cannot force a global closure.
+        component_of: dict[str, int] = {}
+        components: list[list[str]] = []
+        for start in self.ordered:
+            if start in component_of:
+                continue
+            component_id = len(components)
+            components.append([])
+            component_of[start] = component_id
+            pending = [start]
+            while pending:
+                node = pending.pop()
+                for adjacency in (self.children, self.parents):
+                    for neighbour in adjacency.get(node, ()):
+                        if neighbour not in component_of:
+                            component_of[neighbour] = component_id
+                            pending.append(neighbour)
+        for node in self.ordered:
+            components[component_of[node]].append(node)
+
+        for nodes in components:
+            # In an outward or inward tree, branches never reconverge in that
+            # direction: summing subtree sizes is exact, not an approximation.
+            tree = any(
+                all(len(adjacency.get(node, ())) <= 1 for node in nodes)
+                for adjacency in (self.parents, self.children)
+            )
+            if tree:
+                ancestors: dict[str, int] = {}
+                descendants: dict[str, int] = {}
+                for node in nodes:
+                    ancestors[node] = sum(ancestors[parent] + 1 for parent in self.parents.get(node, ()))
+                for node in reversed(nodes):
+                    descendants[node] = sum(descendants[child] + 1 for child in self.children.get(node, ()))
+                for node in nodes:
+                    self.counts[node] = len(self.ordered) - 1 - ancestors[node] - descendants[node]
+                continue
+
+            # General DAGs require deduplication at joins. Integer bitsets use
+            # bits rather than Python sets per reachable pair; discard a closure
+            # after its last consumer. Peak storage follows the live frontier
+            # within this component (quadratic bits in the worst case), never
+            # the quadratic ambiguity complement or two retained closures.
+            positions = {node: position for position, node in enumerate(nodes)}
+            comparable = dict.fromkeys(nodes, 0)
+            for order, incoming, outgoing in (
+                (nodes, self.parents, self.children),
+                (reversed(nodes), self.children, self.parents),
+            ):
+                closures: dict[str, int] = {}
+                consumers = {node: len(outgoing.get(node, ())) for node in nodes}
+                for node in order:
+                    bits = 0
+                    for previous in incoming.get(node, ()):
+                        bits |= closures[previous] | (1 << positions[previous])
+                        consumers[previous] -= 1
+                        if not consumers[previous]:
+                            del closures[previous]
+                    comparable[node] += bits.bit_count()
+                    if consumers[node]:
+                        closures[node] = bits
+            for node in nodes:
+                self.counts[node] = len(self.ordered) - 1 - comparable[node]
 
 
 class _AmbiguousRefs(Sequence[str]):
