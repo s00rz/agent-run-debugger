@@ -5,8 +5,8 @@ Three rules make this different from "sort the log by timestamp":
 * **Causation comes from the recorded parent graph, not from wall clocks.** The
   display is a topological order of the known edges with stable tie-breaks
   (attempt sequence, source sequence, wall time, event id).
-* **Concurrency stays ambiguous.** Two events with no causal path between them are
-  reported as an ambiguous pair. Sibling retries or a fork/join are not a
+* **Unknown order stays ambiguous.** Two events with no causal path between them are
+  counted as ambiguous, not asserted concurrent. Sibling retries or a fork/join are not a
   sequential story, and pretending otherwise invents causation.
 * **Missing parents stay visible.** An event whose parent is absent from the trace
   is a root with a recorded gap — never an inferred edge.
@@ -21,7 +21,7 @@ import heapq
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
-from itertools import pairwise
+from itertools import islice, pairwise
 from typing import Any
 
 from .event_v1 import Event, Gap, ValidationResult
@@ -39,8 +39,104 @@ __all__ = [
 #: Wall-clock delta above which a gap is *reported* (as a hypothesis unless clock
 #: evidence supports it).
 DEFAULT_STALL_THRESHOLD_S = 60.0
-#: Above this many events, ambiguity detection falls back to sibling groups only.
+#: Retained for API compatibility; analysis no longer drops non-sibling ambiguity.
 AMBIGUITY_LIMIT = 2000
+
+
+class _AmbiguityIndex:
+    """Store the graph, not its quadratic complement; expand relations on demand."""
+
+    def __init__(self, ordered: Sequence[str], edges: Sequence[tuple[str, str]]) -> None:
+        self.ordered = tuple(ordered)
+        self.children: dict[str, set[str]] = {}
+        self.parents: dict[str, set[str]] = {}
+        for parent, child in edges:
+            self.children.setdefault(parent, set()).add(child)
+            self.parents.setdefault(child, set()).add(parent)
+        self.counts: dict[str, int] = {}
+
+    def related(self, event_id: str) -> set[str]:
+        related = {event_id}
+        for adjacency in (self.children, self.parents):
+            seen: set[str] = set()
+            pending = list(adjacency.get(event_id, ()))
+            while pending:
+                node = pending.pop()
+                if node not in seen:
+                    seen.add(node)
+                    pending.extend(adjacency.get(node, ()))
+            related.update(seen)
+        return related
+
+    def count(self, event_id: str) -> int:
+        if event_id not in self.counts:
+            self.counts[event_id] = len(self.ordered) - len(self.related(event_id))
+        return self.counts[event_id]
+
+
+class _AmbiguousRefs(Sequence[str]):
+    def __init__(self, index: _AmbiguityIndex, event_id: str) -> None:
+        self.index = index
+        self.event_id = event_id
+
+    def __len__(self) -> int:
+        return self.index.count(self.event_id)
+
+    def __iter__(self):
+        related = self.index.related(self.event_id)
+        return (ref for ref in self.index.ordered if ref not in related)
+
+    def __getitem__(self, key):
+        return _sequence_item(self, key)
+
+    def __eq__(self, other):
+        return isinstance(other, Sequence) and tuple(self) == tuple(other)
+
+
+class _AmbiguousPairs(Sequence[tuple[str, str]]):
+    def __init__(self, index: _AmbiguityIndex) -> None:
+        self.index = index
+
+    def __len__(self) -> int:
+        return sum(self.index.count(ref) for ref in self.index.ordered) // 2
+
+    def __iter__(self):
+        for position, first in enumerate(self.index.ordered):
+            related = self.index.related(first)
+            for second in islice(self.index.ordered, position + 1, None):
+                if second not in related:
+                    yield first, second
+
+    def __getitem__(self, key):
+        return _sequence_item(self, key)
+
+    def __eq__(self, other):
+        return isinstance(other, Sequence) and len(self) == len(other) and all(
+            first == second for first, second in zip(self, other, strict=True)
+        )
+
+
+def _sequence_item(values: Sequence, key):
+    if isinstance(key, slice):
+        start, stop, step = key.indices(len(values))
+        if step > 0:
+            return tuple(islice(values, start, stop, step))
+        return tuple(values)[key]
+    position = key if key >= 0 else len(values) + key
+    if position < 0:
+        raise IndexError(key)
+    try:
+        return next(islice(values, position, position + 1))
+    except StopIteration:
+        raise IndexError(key) from None
+
+
+def _display_summary(value: Any, *, full: bool = False) -> str:
+    """Single-line terminal-safe preview; complete retained text stays structured."""
+    text = safe_text(value).replace("\r", "\\r").replace("\n", "\\n")
+    if not full and len(text) > 240:
+        return text[:240] + "… [preview; full retained text in structured output]"
+    return text
 
 
 class TimelineContradiction(ValueError):
@@ -53,7 +149,7 @@ class TimelineEntry:
     depth: int
     order: int
     event: Event
-    ambiguous_with: tuple[str, ...] = ()
+    ambiguous_with: Sequence[str] = ()
 
     @property
     def kind(self) -> str:
@@ -67,7 +163,8 @@ class TimelineEntry:
     def causal_parents(self) -> tuple[str, ...]:
         return self.event.causal_parents
 
-    def as_dict(self) -> dict[str, Any]:
+    def as_dict(self, *, expand_ambiguity: bool = False) -> dict[str, Any]:
+        """Return retained evidence; pair arrays are opt-in, with explicit counts."""
         return {
             "order": self.order,
             "event_ref": self.event_id,
@@ -81,7 +178,14 @@ class TimelineEntry:
             "provenance": self.event.semantic_provenance,
             "depth": self.depth,
             "causal_parents": list(self.causal_parents),
-            "ambiguous_with": list(self.ambiguous_with),
+            "ambiguous_with": list(self.ambiguous_with) if expand_ambiguity else [],
+            "ambiguous_with_count": len(self.ambiguous_with),
+            "ambiguity_expanded": expand_ambiguity,
+            "source_sequence": self.event.source_sequence,
+            "span_ref": self.event.span_id,
+            "evidence_ref": self.event.evidence_ref,
+            "arguments_ref": self.event.arguments_ref,
+            "reported_error": self.event.reported_error,
         }
 
 
@@ -90,7 +194,7 @@ class Timeline:
     run_id: str
     entries: list[TimelineEntry] = field(default_factory=list)
     gaps: list[Gap] = field(default_factory=list)
-    ambiguous_pairs: list[tuple[str, str]] = field(default_factory=list)
+    ambiguous_pairs: Sequence[tuple[str, str]] = field(default_factory=list)
     quarantined: list[Event] = field(default_factory=list)
     suspect_windows: list[dict[str, Any]] = field(default_factory=list)
     clock_notes: list[str] = field(default_factory=list)
@@ -108,12 +212,19 @@ class Timeline:
                 return item
         return None
 
-    def as_dict(self) -> dict[str, Any]:
+    def as_dict(self, *, expand_ambiguity: bool = False) -> dict[str, Any]:
+        """Compact graph by default; opt in to the legacy expanded pair arrays."""
         return {
             "run_id": self.run_id,
-            "entries": [entry.as_dict() for entry in self.entries],
+            "entries": [entry.as_dict(expand_ambiguity=expand_ambiguity) for entry in self.entries],
             "gaps": [gap.as_dict() for gap in self.gaps],
-            "ambiguous_pairs": [list(pair) for pair in self.ambiguous_pairs],
+            "ambiguous_pairs": [list(pair) for pair in self.ambiguous_pairs] if expand_ambiguity else [],
+            "ambiguity": {
+                "pair_count": len(self.ambiguous_pairs),
+                "expanded": expand_ambiguity,
+                "rule": "two entries are ambiguous iff neither reaches the other via causal_parents",
+                "detail": "iterate ambiguous_pairs / entry.ambiguous_with, or as_dict(expand_ambiguity=True)",
+            },
             "quarantined": [event.event_id for event in self.quarantined],
             "suspect_windows": self.suspect_windows,
             "clock_notes": self.clock_notes,
@@ -121,7 +232,8 @@ class Timeline:
             "attempts": self.attempts,
         }
 
-    def text(self) -> str:
+    def text(self, *, expand_ambiguity: bool = False, full_text: bool = False) -> str:
+        """Navigate all events; optionally expand pairs and full retained details."""
         lines: list[str] = [
             f"timeline for run {safe_text(self.run_id)}",
             "ordering: recorded causal parents first, then attempt/source sequence; "
@@ -130,21 +242,36 @@ class Timeline:
         for note in self.notes:
             lines.append(f"note: {safe_text(note)}")
         for entry in self.entries:
-            label = f" {entry.event.name}" if entry.event.name else ""
+            label = f" {_display_summary(entry.event.name)}" if entry.event.name else ""
             usage = entry.event.usage
             token_note = ""
             if usage.total_tokens() is not None:
                 token_note = f" tokens={usage.total_tokens()} (reported)"
-            ambiguity = f" ambiguous-with={','.join(entry.ambiguous_with)}" if entry.ambiguous_with else ""
+            ambiguity = f" ambiguous-with-count={len(entry.ambiguous_with)}" if entry.ambiguous_with else ""
             lines.append(
-                f"{entry.order:04d} depth={entry.depth} {entry.kind}{label} "
-                f"status={entry.status} at={entry.event.wall_time or 'unknown'} "
-                f"clock={entry.event.clock.quality} [{entry.event.semantic_provenance}]"
+                f"{entry.order:04d} event={safe_text(entry.event_id)} "
+                f"attempt={safe_text(entry.event.attempt_id)} seq={entry.event.source_sequence} "
+                f"depth={entry.depth} {safe_text(entry.kind)}{label} "
+                f"status={safe_text(entry.status)} at={safe_text(entry.event.wall_time or 'unknown')} "
+                f"clock={safe_text(entry.event.clock.quality)} [{safe_text(entry.event.semantic_provenance)}]"
                 f"{token_note}{ambiguity}"
             )
+            refs = {"parents": ','.join(entry.causal_parents), "span": entry.event.span_id,
+                    "evidence": entry.event.evidence_ref, "arguments": entry.event.arguments_ref}
+            if any(refs.values()):
+                lines.append("     " + " ".join(f"{key}={safe_text(value)}" for key, value in refs.items() if value))
+            if entry.event.reported_error:
+                lines.append(
+                    f"     reported detail (data): {_display_summary(entry.event.reported_error, full=full_text)}"
+                )
         if not self.entries:
             lines.append("(no events)")
-        for pair in self.ambiguous_pairs:
+        lines.append(
+            f"ambiguous order: {len(self.ambiguous_pairs)} pair(s) have no causal path; "
+            "display order is navigation, not proof of concurrency or causation. "
+            "Details: ambiguous_pairs, as_dict(expand_ambiguity=True), or text(expand_ambiguity=True)."
+        )
+        for pair in self.ambiguous_pairs if expand_ambiguity else ():
             lines.append(
                 f"ambiguous order: {safe_text(pair[0])} <-> {safe_text(pair[1])} "
                 "(no causal path between them, so their order is unknown)"
@@ -217,27 +344,6 @@ def _detect_cycle(nodes: Sequence[str], edges: Sequence[tuple[str, str]]) -> lis
     return []
 
 
-def _reachable(nodes: Sequence[str], edges: Sequence[tuple[str, str]]) -> dict[str, set[str]]:
-    adjacency: dict[str, list[str]] = {}
-    for parent, child in edges:
-        adjacency.setdefault(parent, []).append(child)
-    memo: dict[str, set[str]] = {}
-
-    def walk(node: str, seen: set[str]) -> set[str]:
-        if node in memo:
-            return memo[node]
-        result: set[str] = set()
-        for child in adjacency.get(node, []):
-            if child in seen:
-                continue
-            result.add(child)
-            result |= walk(child, seen | {child})
-        memo[node] = result
-        return result
-
-    return {node: walk(node, {node}) for node in nodes}
-
-
 def build_timeline(
     result: ValidationResult,
     *,
@@ -301,29 +407,8 @@ def build_timeline(
     if len(ordered) != len(remaining):  # pragma: no cover - defended by cycle handling above
         raise TimelineContradiction("parent graph could not be ordered completely")
 
-    ambiguous: dict[str, set[str]] = {event_id: set() for event_id in ordered}
-    if len(ordered) <= AMBIGUITY_LIMIT:
-        reached = _reachable(ordered, edges)
-        for index, first in enumerate(ordered):
-            for second in ordered[index + 1:]:
-                if second in reached.get(first, ()) or first in reached.get(second, ()):
-                    continue
-                ambiguous[first].add(second)
-                ambiguous[second].add(first)
-                timeline.ambiguous_pairs.append((first, second))
-    else:
-        siblings: dict[str, list[str]] = {}
-        for parent, child in edges:
-            siblings.setdefault(parent, []).append(child)
-        for group in siblings.values():
-            for index, first in enumerate(group):
-                for second in group[index + 1:]:
-                    ambiguous[first].add(second)
-                    ambiguous[second].add(first)
-                    timeline.ambiguous_pairs.append((first, second))
-        timeline.notes.append(
-            f"ambiguity analysis limited to sibling groups above {AMBIGUITY_LIMIT} events"
-        )
+    ambiguity_index = _AmbiguityIndex(ordered, edges)
+    timeline.ambiguous_pairs = _AmbiguousPairs(ambiguity_index)
 
     timeline.entries = [
         TimelineEntry(
@@ -331,14 +416,15 @@ def build_timeline(
             depth=depth[event_id],
             order=index,
             event=by_id[event_id],
-            ambiguous_with=tuple(sorted(ambiguous.get(event_id, ()))),
+            ambiguous_with=_AmbiguousRefs(ambiguity_index, event_id),
         )
         for index, event_id in enumerate(ordered)
     ]
 
     _annotate_clocks(timeline, timeline.entries, stall_threshold_s)
     timeline.notes.append(
-        "concurrent events are reported as ambiguous pairs: wall-clock order alone is not causation"
+        "unknown causal relationships are counted without expanding every pair; "
+        "wall-clock order alone is not causation"
     )
     return timeline
 
