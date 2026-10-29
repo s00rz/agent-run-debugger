@@ -45,7 +45,7 @@ __all__ = [
     "limits_from_settings",
 ]
 
-SUPPORTED_FORMATS = ("v1", "claude", "hermes")
+SUPPORTED_FORMATS = ("v1", "claude", "hermes", "cauldron")
 
 ARCHIVE_SUFFIXES = (
     ".zip", ".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz", ".gz", ".bz2",
@@ -241,6 +241,12 @@ def import_trace(
     limits = limits or StreamLimits()
     guard_source(p)
     resolved = detect_format(p, explicit=fmt)
+    if resolved == "cauldron":
+        from .import_cauldron import import_cauldron_trace
+
+        return import_cauldron_trace(
+            [p], limits=limits, allow_partial=allow_partial, retention_mode=retention_mode
+        )
     if resolved == "claude":
         from .import_claude import import_claude_trace
 

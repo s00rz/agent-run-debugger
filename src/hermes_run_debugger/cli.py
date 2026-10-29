@@ -122,7 +122,15 @@ class Services:
     ) -> list[dict[str, Any]]:
         results: list[dict[str, Any]] = []
 
-        if fmt == "hermes":
+        if fmt == "cauldron":
+            from .import_cauldron import import_cauldron_trace
+
+            combined = import_cauldron_trace(
+                paths, limits=self.settings.limits(), allow_partial=partial,
+                retention_mode=self.settings.retention_mode,
+            )
+            imported_list = [combined]
+        elif fmt == "hermes":
             from .import_hermes import import_hermes_trace
 
             combined = import_hermes_trace(
@@ -179,8 +187,29 @@ class Services:
         run = self.store().load_run(run_id)
         return build_timeline(_as_result(run))
 
-    def timeline_text(self, run_id: str) -> str:
-        return self.load_timeline(run_id).text()
+    def timeline_text(self, run_id: str, *, event_ref: str | None = None) -> str:
+        timeline = self.load_timeline(run_id)
+        if event_ref is None:
+            return timeline.text()
+        selected = timeline.entry(event_ref)
+        if selected is None:
+            raise ValueError(f"event {event_ref!r} is not in run {run_id!r}")
+        event = selected.event
+        related = [entry.event for entry in timeline.entries if (
+            entry.event_id == event_ref
+            or entry.event_id in event.causal_parents
+            or event_ref in entry.causal_parents
+            or (event.span_id is not None and entry.event.span_id == event.span_id
+                and entry.event.attempt_id == event.attempt_id)
+            or (event.arguments_ref is not None and entry.event.arguments_ref == event.arguments_ref
+                and entry.event.name == event.name and entry.event.attempt_id == event.attempt_id)
+        )]
+        return json.dumps({
+            "run_id": run_id, "selected_event": event_ref,
+            "relationship": "recorded parents/children, same call span, or same request in the same attempt",
+            "events": [item.as_dict() for item in related],
+            "notice": "same request is not proof of the same durable outcome; source references are pointers",
+        }, indent=2, ensure_ascii=False) + "\n"
 
     def explain_text(self, run_id: str, *, as_json: bool = False) -> str:
         timeline = self.load_timeline(run_id)
@@ -313,7 +342,7 @@ def run_cli(argv: Sequence[str], services: Services) -> int:
             return 0
         if command == "timeline":
             run_id = _positional(rest) or _flag_value(rest, "--run")
-            print(services.timeline_text(_require_run(run_id)))
+            print(services.timeline_text(_require_run(run_id), event_ref=_flag_value(rest, "--event")))
             return 0
         if command == "explain":
             run_id = _positional(rest) or _flag_value(rest, "--run")
@@ -418,7 +447,7 @@ def handle_slash(raw_args: str, services: Services) -> str:
         if not run_id:
             return f"{command} needs a run id\n{_USAGE}"
         if command == "timeline":
-            return services.timeline_text(run_id)
+            return services.timeline_text(run_id, event_ref=_flag_value(rest, "--event"))
         if command == "explain":
             return services.explain_text(run_id)
         return services.replay_text(run_id)
@@ -448,7 +477,7 @@ def tool_timeline(args: Mapping[str, Any] | None, services: Services) -> str:
     if not run_id:
         return json.dumps({"ok": False, "error": "a run id is required"})
     try:
-        return services.timeline_text(run_id)
+        return services.timeline_text(run_id, event_ref=payload.get("event"))
     except (FileNotFoundError, ValueError, TimelineContradiction) as exc:
         return json.dumps({"ok": False, "error": str(exc)})
 
@@ -459,7 +488,7 @@ def tool_explain(args: Mapping[str, Any] | None, services: Services) -> str:
     if not run_id:
         return json.dumps({"ok": False, "error": "a run id is required"})
     try:
-        return services.explain_text(run_id)
+        return services.explain_text(run_id, as_json=bool(payload.get("json", False)))
     except (FileNotFoundError, ValueError, TimelineContradiction) as exc:
         return json.dumps({"ok": False, "error": str(exc)})
 

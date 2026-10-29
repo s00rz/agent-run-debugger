@@ -54,6 +54,24 @@ hermes run-debug import --file ./run.jsonl --format hermes
 
 Adding another harness means adding one adapter that maps its records onto `event-v1`. The store, timeline, diagnosis, replay and report layers stay the same.
 
+### Debug agent actions and harness boundaries
+
+`explain` follows failed actions through their later results. It distinguishes a repeated
+unchanged request, a changed request and a later reported success of the same operation.
+Different operations behind `tool_call` are not treated as a single retry loop. The
+structured diagnosis includes `action_chains` and separately reported attempt outcomes.
+
+Use `hermes run-debug timeline --run <id> --event <event-id>` (or the timeline tool's
+`event` argument) to inspect the event, its recorded parents/children and same-request
+results. Source references point back to the recording; they do not authenticate the
+durable business effect. The explain tool accepts `json: true` for machine-readable output.
+
+Cauldron harness receipts can be selected explicitly with `--format cauldron`.
+This imports recorded stage and lifecycle evidence, not a live run or a second scorer.
+Keep agent operation recovery, harness setup/cleanup and the UAT business score separate.
+Existing imports remain readable; re-import selected original exports for richer request
+identity. The debugger does not fill missing history with guesses.
+
 ## Surfaces
 
 | Surface | Route |

@@ -15,13 +15,14 @@ Documented source semantics this adapter implements:
   back to ``ast.literal_eval``. A value that parses as neither is reported as an
   unsupported record, never guessed at.
 * **``tool_message.content`` is a JSON object string** carrying ``exit_code`` and
-  ``error`` for command-shaped tools. Status is derived only from an explicit signal:
-  a non-zero ``exit_code`` or a truthy ``error`` means failed; a zero ``exit_code``
-  means ok; anything else — including a payload with no status field at all — is
-  ``unknown``. Absence of an error is not treated as success.
-* **The export reports no task outcome.** ``end_reason`` describes why the session
+  ``error`` for command-shaped tools. Status is derived only from explicit fields:
+  failure status, truthy ``error`` or boolean ``success=False`` takes precedence;
+  integer exit codes, boolean ``success`` and known status enums are mapped next.
+  A payload without a status signal stays ``unknown``. Prose is never a verdict.
+* **Ordinary exports report no task outcome.** ``end_reason`` describes why the session
   process stopped (``user_exit``, ``startup_orphan_reap``, …), which is not a task
-  result. The attempt outcome stays ``unknown``.
+  result. The attempt outcome stays ``unknown`` unless an explicit typed ``outcome``
+  is present; tool success or assistant prose never supplies a task outcome.
 
 What is deliberately NOT retained: prompt text and tool arguments (opaque references
 only), and tool-result text under ``retention_mode="metadata-only"``.
@@ -41,11 +42,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .event_v1 import EVENT_KINDS, Gap, validate_trace_records
+from .event_v1 import EVENT_KINDS, OUTCOMES, Gap, validate_trace_records
 from .identity import content_ref, redacted_content_ref, sha256_hex, stable_id
 from .import_v1 import ImportRefused, TraceImport, guard_source
 from .jsonio import InputLimitExceeded, MalformedRecord, ScanState, StreamLimits, scan_jsonl
-from .redact import sanitise_message
+from .redact import redact_record, sanitise_message
 
 __all__ = ["MAX_RESULT_SUMMARY", "RETENTION_MODES", "import_hermes_trace"]
 
@@ -178,12 +179,64 @@ def _call_arguments(call: Mapping[str, Any]) -> Any:
     return call.get("arguments")
 
 
+def _argument_value(raw: Any) -> Any:
+    """Compare JSON arguments by value, not formatting; never evaluate code."""
+    if isinstance(raw, str):
+        try:
+            return json.loads(raw)
+        except ValueError:
+            pass
+    return raw
+
+
+def _operation(call: Mapping[str, Any]) -> tuple[str | None, str | None]:
+    """Unwrap a recorded single dispatch, without guessing batch result ownership.
+
+    Hermes returns the inner payload directly for a single ``tool_call`` dispatch.
+    Multi-call batches retain their wrapper name and whole request reference: an
+    aggregate failure cannot safely be attributed to every member. Arguments are
+    redacted before computing the reference and are never retained themselves.
+    """
+    name = _call_name(call)
+    arguments = _argument_value(_call_arguments(call))
+    if name in {"tool_call", "functions.tool_call"} and isinstance(arguments, Mapping):
+        calls = arguments.get("calls")
+        if isinstance(calls, list) and len(calls) == 1 and isinstance(calls[0], Mapping):
+            inner = calls[0]
+            if _call_name(inner):
+                name = _call_name(inner)
+                arguments = _argument_value(_call_arguments(inner))
+    if arguments is None:
+        return name, None
+    redacted, _ = redact_record(arguments, stage="pre-store")
+    reference = redacted_content_ref(redacted)
+    # Redaction can collapse distinct requests. Keep the safe reference useful
+    # for navigation, but never advertise that lossy equality as exact identity.
+    if redacted != arguments:
+        reference = "lossy:" + reference
+    return name, reference
+
+
+def _reported_outcome(record: Mapping[str, Any]) -> str:
+    """Only a typed task outcome is a task outcome; end_reason is not one."""
+    value = record.get("outcome")
+    return value if isinstance(value, str) and value in OUTCOMES else "unknown"
+
+
 def _call_id(call: Mapping[str, Any], fallback: str) -> str:
     for key in ("id", "call_id"):
         value = call.get(key)
         if isinstance(value, str) and value:
             return value
     return fallback
+
+
+def _recorded_call_ids(call: Mapping[str, Any]) -> set[str]:
+    """Both source ID aliases are usable; synthesized display IDs are not."""
+    return {
+        value for key in ("id", "call_id")
+        if isinstance((value := call.get(key)), str) and value
+    }
 
 
 def _payload(message: Mapping[str, Any]) -> Any:
@@ -203,7 +256,13 @@ def _payload(message: Mapping[str, Any]) -> Any:
             for item in raw
             if isinstance(item, Mapping) and item.get("text")
         ]
-        return "\n".join(parts) if parts else None
+        if not parts:
+            return None
+        text = "\n".join(parts)
+        try:
+            return json.loads(text)
+        except ValueError:
+            return text
     return raw
 
 
@@ -218,11 +277,17 @@ def _tool_status(payload: Any) -> str:
     reported = payload.get("status")
     if isinstance(reported, str) and reported.strip().lower() in _FAILURE_STATUS_VALUES:
         return "failed"
+    if payload.get("error") or payload.get("success") is False:
+        return "failed"
     code = payload.get("exit_code")
     if isinstance(code, int) and not isinstance(code, bool):
         return "ok" if code == 0 else "failed"
-    if payload.get("error"):
-        return "failed"
+    if payload.get("success") is True:
+        return "ok"
+    if isinstance(reported, str) and reported in {"ok", "success", "completed"}:
+        return "ok"
+    if isinstance(reported, str) and reported in {"interrupted", "cancelled", "canceled"}:
+        return "interrupted"
     return "unknown"
 
 
@@ -297,8 +362,8 @@ def _build_trace(
             "started_at": _iso(record.get("started_at")),
             "ended_at": _iso(record.get("ended_at")),
             # ``end_reason`` says why the process stopped, not how the task went.
-            "outcome": "unknown",
-            "unknowns": ["outcome"],
+            "outcome": _reported_outcome(record),
+            "unknowns": ["outcome"] if _reported_outcome(record) == "unknown" else [],
         })
     # A child session whose parent was exported alongside it hangs off that attempt.
     for record in (record for source in sources for record in source.sessions):
@@ -330,6 +395,17 @@ def _build_trace(
             stats["messages_read"] += len(messages)
 
             tool_event_by_call: dict[str, str] = {}
+            operation_by_call: dict[str, tuple[str | None, str | None]] = {}
+            span_by_call: dict[str, str] = {}
+            ambiguous_calls: set[str] = set()
+            seen_call_ids: set[str] = set()
+            for message in messages:
+                if message.get("role") != "assistant":
+                    continue
+                for call in _tool_calls(message.get("tool_calls")):
+                    ids = _recorded_call_ids(call)
+                    ambiguous_calls.update(ids & seen_call_ids)
+                    seen_call_ids.update(ids)
             last_event: str | None = None
 
             for message_index, message in enumerate(messages):
@@ -372,6 +448,7 @@ def _build_trace(
                         stats["unparsed_tool_calls"] += 1
                     for call_index, call in enumerate(calls):
                         call_id = _call_id(call, f"{message_id}-call{call_index}")
+                        name, arguments_ref = _operation(call)
                         tool_event = emit({
                             "kind": "event",
                             "event_id": stable_id(
@@ -391,13 +468,17 @@ def _build_trace(
                             "evidence_ref": f"hermes:{session_id}:tool_call:{call_id}",
                             "delivered_via": "import",
                             "semantic_provenance": "reported",
-                            "name": _call_name(call),
+                            "name": name,
                             # The arguments themselves are never retained: a ref only.
-                            "arguments_ref": redacted_content_ref(_call_arguments(call)),
+                            "arguments_ref": arguments_ref,
                             "gaps": [],
                             "contradictions": [],
                         })
-                        tool_event_by_call[call_id] = tool_event
+                        # A generated display span is not a recorded linkage key.
+                        for recorded_id in _recorded_call_ids(call):
+                            tool_event_by_call[recorded_id] = tool_event
+                            operation_by_call[recorded_id] = (name, arguments_ref)
+                            span_by_call[recorded_id] = call_id
                         last_event = tool_event
                         stats["tool_calls_started"] += 1
                     continue
@@ -408,7 +489,11 @@ def _build_trace(
                     payload = _payload(message)
                     if payload is None:
                         stats["unparsed_tool_results"] += 1
-                    parent = tool_event_by_call.get(call_key) or last_event
+                    parent = (
+                        tool_event_by_call.get(call_key)
+                        if call_key not in ambiguous_calls else None
+                    )
+                    operation = operation_by_call.get(call_key) if parent else None
                     event_id = emit({
                         "kind": "event",
                         "event_id": stable_id(
@@ -418,7 +503,7 @@ def _build_trace(
                         "run_id": run_id,
                         "attempt_id": attempt_id,
                         # The source's own tool-call id links a result to its start.
-                        "span_id": call_key or None,
+                        "span_id": span_by_call[call_key] if parent else None,
                         "causal_parents": [parent] if parent else [],
                         "wall_time": wall,
                         "monotonic_ms": None,
@@ -430,9 +515,14 @@ def _build_trace(
                         "evidence_ref": f"hermes:{session_id}:tool_result:{call_key or message_id}",
                         "delivered_via": "import",
                         "semantic_provenance": "reported",
-                        "name": message.get("tool_name")
-                        if isinstance(message.get("tool_name"), str) else None,
-                        "gaps": [],
+                        "name": operation[0] if operation else (
+                            message.get("tool_name")
+                            if isinstance(message.get("tool_name"), str) else None
+                        ),
+                        "arguments_ref": operation[1] if operation else None,
+                        "gaps": [] if parent else [
+                            "tool result has no unique recorded call-id match; no causal parent inferred"
+                        ],
                         "contradictions": [],
                     })
                     stats["tool_results"] += 1
@@ -488,7 +578,7 @@ def _build_trace(
         )
     notes.append(
         "adapter semantics: prompt text and tool arguments are never retained (opaque references "
-        "only); the export reports no task outcome, so the attempt outcome stays unknown"
+        "only); only an explicit typed outcome is a task outcome; end_reason is not one"
     )
 
     covered = sorted({str(event["event_kind"]) for event in events} & EVENT_KINDS)
@@ -499,7 +589,7 @@ def _build_trace(
         "trace_id": trace_id,
         "run_id": run_id,
         "importer": "import_hermes",
-        "importer_version": "0.1.0",
+        "importer_version": "0.1.1",
         "source_format": "hermes-session-jsonl",
         "source_scope": "explicit-selection",
         "created_at": _iso(sources[0].sessions[0].get("started_at")) if sources else None,
