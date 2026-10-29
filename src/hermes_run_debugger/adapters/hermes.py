@@ -71,7 +71,8 @@ _IMPORT_SCHEMA = {
     "name": "rundebug_import",
     "description": (
         "Import one or more explicitly selected trace files (agent-run-debugger format 'v1' or a "
-        "Claude JSONL transcript). Reads only the files named here; directories and archives are "
+        "Claude/Hermes JSONL transcript, or explicitly selected Cauldron JSON receipts). "
+        "Reads only the files named here; directories and archives are "
         "refused. Nothing is executed and nothing leaves the machine."
     ),
     "parameters": {
@@ -187,6 +188,20 @@ def register(ctx: Any) -> None:
             _STATUS_SCHEMA if name == "rundebug_status"
             else dict(_RUN_SCHEMA, name=name, description=description)
         )
+        if name in {"rundebug_timeline", "rundebug_explain"}:
+            parameters = dict(schema["parameters"])
+            properties = dict(parameters["properties"])
+            if name == "rundebug_timeline":
+                properties["event"] = {
+                    "type": "string",
+                    "description": "Inspect this exact event plus recorded links and same-request follow-through.",
+                }
+            else:
+                properties["json"] = {
+                    "type": "boolean", "description": "Return structured action chains and hypotheses.",
+                }
+            parameters["properties"] = properties
+            schema = dict(schema, parameters=parameters)
         ctx.register_tool(
             name=name,
             toolset="rundebug",
@@ -220,6 +235,8 @@ def _setup_cli_command(parser: Any) -> None:
     ):
         command = sub.add_parser(name, help=help_text)
         command.add_argument("--run", required=True)
+        if name == "timeline":
+            command.add_argument("--event", help="Inspect one event and its recorded action relationships.")
         if name == "explain":
             command.add_argument("--json", action="store_true")
     export_cmd = sub.add_parser("export", help="Write a private report (operator CLI only).")
@@ -252,6 +269,8 @@ def _handle_cli_command(args: Any, *, services: Services) -> int:
         argv += ["--run", args.run]
         if getattr(args, "json", False):
             argv.append("--json")
+        if getattr(args, "event", None):
+            argv += ["--event", args.event]
     try:
         return run_cli(argv, services)
     finally:

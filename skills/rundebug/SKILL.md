@@ -22,6 +22,12 @@ A run failed, stalled, looped, or cost more than expected, and the question is
 3. **Read the diagnosis.** `/rundebug explain <run-id>`. Take each hypothesis with
    its alternatives and its falsifier; treat `confidence` as a category derived from
    the recorded evidence, not a probability.
+   Start with action follow-through: unchanged failed requests, changed requests,
+   and a later success of the same operation are different observations. A shared
+   wrapper name such as `tool_call` does not make unrelated requests a retry loop.
+   `rundebug_explain` accepts `json: true` for structured action chains.
+   Drill into a cited event with `rundebug_timeline` using `run` and `event`, or
+   `hermes run-debug timeline --run <run-id> --event <event-id>`.
 4. **Falsify before believing.** Falsifiers are read-only checks you run yourself.
    The debugger does not re-execute anything.
 5. **Replay to reconstruct the sequence** when you need to walk the run in order:
@@ -39,6 +45,13 @@ A run failed, stalled, looped, or cost more than expected, and the question is
 - Token counts are reported usage, not money. Unknown billing stays null.
 - Concurrent events appear as ambiguous pairs. Wall-clock order alone is not
   causation.
+- Diagnose the actions and their handoffs first; the consuming agent can supply
+  the UAT score. Import explicitly selected Cauldron harness JSON receipts with
+  `--format cauldron` to inspect stage failures and recorded lifecycle outcomes.
+  Keep setup, cleanup, process completion and business correctness separate.
+- For old imports, missing request identity remains unknown. Re-import the
+  explicitly selected original export to obtain richer call/result linkage;
+  never reconstruct missing arguments from a diagnosis or overwrite old evidence.
 - There are no causal findings in this build. A causal claim needs a controlled
   intervention, which is a separately gated lane.
 

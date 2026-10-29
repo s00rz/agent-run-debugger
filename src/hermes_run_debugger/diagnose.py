@@ -93,6 +93,8 @@ class Diagnosis:
     correctness_claims: list[dict[str, Any]] = field(default_factory=list)
     #: Causal findings. Always empty here; a controlled intervention is required.
     causal_findings: list[dict[str, Any]] = field(default_factory=list)
+    action_chains: list[dict[str, Any]] = field(default_factory=list)
+    attempt_outcomes: list[dict[str, Any]] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -105,10 +107,25 @@ class Diagnosis:
             "cost": self.cost,
             "correctness_claims": self.correctness_claims,
             "causal_findings": self.causal_findings,
+            "action_chains": self.action_chains,
+            "attempt_outcomes": self.attempt_outcomes,
         }
 
     def text(self) -> str:
         lines = [f"diagnosis for run {safe_text(self.run_id)}"]
+        lines.append("action follow-through (recorded sequence, not proof of task correctness):")
+        for chain in self.action_chains:
+            lines.append(
+                f"  - {safe_text(chain['operation'])} at {chain['failure_ref']}: "
+                f"{chain['follow_through']}"
+                + (f"; next result={chain['next_result_ref']}" if chain['next_result_ref'] else "")
+                + (f"; source={safe_text(chain['evidence_ref'])}" if chain['evidence_ref'] else "")
+            )
+            lines.append(f"      inspect: {chain['next_check']}")
+        if not self.action_chains:
+            lines.append("  - no failed tool actions recorded")
+        for attempt in self.attempt_outcomes:
+            lines.append(f"attempt {attempt['attempt_id']}: reported outcome={attempt['outcome']}")
         lines.append(f"observed (what the imported evidence reports): {len(self.observed)}")
         for item in self.observed:
             lines.append(
@@ -189,6 +206,12 @@ def diagnose(timeline: Timeline, *, cost: Mapping[str, Any] | None = None) -> Di
     )
 
     _observe(diagnosis, events, timeline)
+    diagnosis.action_chains = _action_chains(events)
+    diagnosis.attempt_outcomes = [
+        {"attempt_id": str(attempt.get("attempt_id") or ""),
+         "outcome": str(attempt.get("outcome") or "unknown")}
+        for attempt in timeline.attempts
+    ]
 
     # A next check that names "the failing events" only makes sense when the evidence reports
     # one. The failure-independent checks stay on every run.
@@ -268,14 +291,14 @@ def _observe(diagnosis: Diagnosis, events: Sequence[Event], timeline: Timeline) 
 
     failed = [event for event in events if event.reported_status == "failed"]
     outcomes = {str(attempt.get("outcome")) for attempt in timeline.attempts}
-    if failed and outcomes == {"completed"}:
+    if failed and outcomes == {"completed"} and any(not _later_success(events, event) for event in failed):
         diagnosis.observed.append({
             "kind": "contradiction:outcome_vs_events",
             "event_ref": failed[0].event_id,
             "detail": (
                 f"the attempt is reported completed while {len(failed)} event(s) report failure "
-                f"({', '.join(event.event_id for event in failed[:5])}); the log contradicts itself "
-                "and this build does not resolve the contradiction"
+                f"({', '.join(event.event_id for event in failed[:5])}); "
+                "but completion does not establish whether those operations recovered or the task passed"
             ),
             "provenance": "inferred",
         })
@@ -455,16 +478,18 @@ def _hypothesise(diagnosis: Diagnosis, events: Sequence[Event], timeline: Timeli
             ),
         ))
 
-    signature_groups: dict[str, list[Event]] = {}
+    signature_groups: dict[tuple[str, str, str], list[Event]] = {}
     for event in events:
         if event.reported_status == "failed" and event.reported_error:
-            signature_groups.setdefault(event.reported_error.strip()[:120], []).append(event)
-    for signature, group in sorted(signature_groups.items()):
+            signature_groups.setdefault(
+                (event.attempt_id, event.name or "", event.reported_error.strip()), []
+            ).append(event)
+    for (_attempt, _name, signature), group in sorted(signature_groups.items()):
         if len(group) >= 2:
             diagnosis.hypotheses.append(Hypothesis(
                 rule_id="R012",
                 statement=(
-                    f"the same reported error appears {len(group)} times ({safe_text(signature)}), "
+                    f"the same reported error appears {len(group)} times ({safe_text(signature[:120])}), "
                     "which is consistent with a deterministic fault rather than transient noise"
                 ),
                 confidence="medium" if len(group) >= 3 else "low",
@@ -480,20 +505,29 @@ def _hypothesise(diagnosis: Diagnosis, events: Sequence[Event], timeline: Timeli
             ))
 
     repeated_tool = [event for event in tool_events if event.reported_status == "failed" and event.name]
-    counts: dict[str, int] = {}
+    groups: dict[tuple[str, str, str], list[Event]] = {}
     for event in repeated_tool:
-        counts[str(event.name)] = counts.get(str(event.name), 0) + 1
-    looping = {name: count for name, count in counts.items() if count >= 3}
+        if event.arguments_ref:
+            identity = event.arguments_ref
+        elif event.reported_error and event.name not in {"tool_call", "execute_code", "terminal"}:
+            identity = "error-only:" + event.reported_error
+        else:
+            continue
+        groups.setdefault((event.attempt_id, str(event.name), identity), []).append(event)
+    looping = {key: group for key, group in groups.items() if len(group) >= 3}
     if looping:
-        worst = max(looping, key=lambda name: looping[name])
-        evidence = tuple(event.event_id for event in repeated_tool if event.name == worst)
+        worst = max(looping, key=lambda key: len(looping[key]))
+        count = len(looping[worst])
+        evidence = tuple(event.event_id for event in looping[worst])
         diagnosis.hypotheses.append(Hypothesis(
             rule_id="R003",
             statement=(
-                f"the run is consistent with a loop: {worst!r} was attempted {looping[worst]} times "
+                f"the run is consistent with a loop: {worst[1]!r} was attempted {count} times "
                 "with a failure status each time"
+                + (" and the same argument reference" if not worst[2].startswith("error-only:")
+                   else "; argument identity is unavailable, only the same reported error is known")
             ),
-            confidence="medium" if looping[worst] >= 4 else "low",
+            confidence="medium" if count >= 4 and not worst[2].startswith("error-only:") else "low",
             evidence_refs=evidence,
             alternatives=(
                 "the repeated attempts were deliberate retries with changing inputs",
@@ -630,11 +664,72 @@ def _same_operation(event: Event, failed: Event) -> bool:
     """
     if event.attempt_id != failed.attempt_id:
         return False
-    if event.span_id != failed.span_id or event.name != failed.name:
+    if event.name != failed.name:
         return False
-    if failed.span_id is not None:
+    if failed.span_id is not None and event.span_id == failed.span_id:
         return True
+    if failed.arguments_ref and event.arguments_ref:
+        return event.arguments_ref == failed.arguments_ref
+    if failed.span_id is not None or event.span_id is not None:
+        return False
     return failed.event_id in event.causal_parents
+
+
+def _action_chains(events: Sequence[Event]) -> list[dict[str, Any]]:
+    """Follow each failed action without equating different requests with recovery."""
+    tools = sorted(
+        (event for event in events if event.event_kind == "tool_call"),
+        key=lambda event: event.source_sequence,
+    )
+    chains: list[dict[str, Any]] = []
+    for index, failed in enumerate(tools):
+        if failed.reported_status != "failed":
+            continue
+        later = [event for event in tools[index + 1:]
+                 if event.attempt_id == failed.attempt_id and event.name == failed.name
+                 and event.reported_status in {"ok", "failed", "interrupted"}]
+        recovered = next((event for event in later
+                          if event.reported_status == "ok" and _same_operation(event, failed)), None)
+        successor = recovered or next(iter(later), None)
+        if recovered:
+            follow_through = "same operation has a later reported success; task correctness remains separate"
+        elif successor and failed.arguments_ref and successor.arguments_ref:
+            if failed.arguments_ref == successor.arguments_ref:
+                follow_through = "unchanged request failed again; no later matching success recorded"
+            else:
+                follow_through = "different request followed; not proof that the original work recovered"
+        elif successor:
+            follow_through = "same tool used later, but request identity is missing; recovery unknown"
+        else:
+            follow_through = "no later result for this operation recorded"
+        chains.append({
+            "failure_ref": failed.event_id,
+            "attempt_ref": failed.attempt_id,
+            "operation": failed.name or "unknown tool",
+            "arguments_ref": failed.arguments_ref,
+            "evidence_ref": failed.evidence_ref,
+            "follow_through": follow_through,
+            "next_result_ref": successor.event_id if successor else None,
+            "next_result_source": successor.evidence_ref if successor else None,
+            "recovery": "reported_success" if recovered else "not_established",
+            "next_check": _action_check(failed),
+        })
+    return chains
+
+
+def _action_check(event: Event) -> str:
+    """Suggest a check from recorded error text, never claim it is the cause."""
+    error = (event.reported_error or "").lower()
+    if any(marker in error for marker in ("validation", "requires a 'name'", "unexpected", "record_ids")):
+        return "compare this request with the tool schema and returned manifest; inspect changed-request follow-through"
+    if any(marker in error for marker in ("permission", "access is denied", "modulenotfounderror", "not found")):
+        return "check the exact execution principal, interpreter, installed dependency and pathname at this boundary"
+    if any(marker in error for marker in ("cannot authenticate", "refus", "duplicate target", "stale")):
+        return ("inspect the refusing owner's evidence and identity preconditions; "
+                "compare the next request before retrying")
+    if any(marker in error for marker in ("timeout", "timed out", "deadline")):
+        return "inspect child execution and stage receipts during this interval; distinguish waiting from active work"
+    return "read this action's source result and the next same-operation result; verify the intended durable effect"
 
 
 def _later_success(events: Sequence[Event], failed: Event) -> bool:
@@ -715,10 +810,11 @@ def _collect_missing_evidence(diagnosis: Diagnosis, timeline: Timeline) -> None:
             "no monotonic clock evidence for at least one long gap, so elapsed time cannot be "
             "separated from suspend or drift"
         )
-    diagnosis.missing_evidence.append(
-        "the source's own terminal decision is not represented here: an evidence reference is not a "
-        "receipt, so success reported by the source stays a reported value"
-    )
+    if not timeline.attempts or any(attempt.get("outcome", "unknown") == "unknown" for attempt in timeline.attempts):
+        diagnosis.missing_evidence.append(
+            "the source's own terminal decision is not represented for at least one attempt; "
+            "later successful activity alone cannot establish the task outcome"
+        )
     for note in timeline.clock_notes:
         diagnosis.missing_evidence.append(f"clock limitation: {safe_text(note)}")
     # de-duplicate while preserving order
