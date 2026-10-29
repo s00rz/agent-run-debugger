@@ -95,6 +95,7 @@ class Diagnosis:
     causal_findings: list[dict[str, Any]] = field(default_factory=list)
     action_chains: list[dict[str, Any]] = field(default_factory=list)
     attempt_outcomes: list[dict[str, Any]] = field(default_factory=list)
+    harness_events: list[dict[str, Any]] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -109,6 +110,7 @@ class Diagnosis:
             "causal_findings": self.causal_findings,
             "action_chains": self.action_chains,
             "attempt_outcomes": self.attempt_outcomes,
+            "harness_events": self.harness_events,
         }
 
     def text(self) -> str:
@@ -126,6 +128,14 @@ class Diagnosis:
             lines.append("  - no failed tool actions recorded")
         for attempt in self.attempt_outcomes:
             lines.append(f"attempt {attempt['attempt_id']}: reported outcome={attempt['outcome']}")
+        if self.harness_events:
+            lines.append("harness boundaries and reported outcomes:")
+            for event in self.harness_events:
+                lines.append(
+                    f"  - {event['event_ref']} {safe_text(event['name'])}: {event['status']}"
+                    + (f"; {safe_text(event['error'])}" if event['error'] else "")
+                    + (f"; source={safe_text(event['evidence_ref'])}" if event['evidence_ref'] else "")
+                )
         lines.append(f"observed (what the imported evidence reports): {len(self.observed)}")
         for item in self.observed:
             lines.append(
@@ -211,6 +221,14 @@ def diagnose(timeline: Timeline, *, cost: Mapping[str, Any] | None = None) -> Di
         {"attempt_id": str(attempt.get("attempt_id") or ""),
          "outcome": str(attempt.get("outcome") or "unknown")}
         for attempt in timeline.attempts
+    ]
+    harness_attempts = {attempt.get("attempt_id") for attempt in timeline.attempts
+                        if attempt.get("role") == "harness"}
+    diagnosis.harness_events = [
+        {"event_ref": event.event_id, "attempt_ref": event.attempt_id,
+         "name": event.name or event.event_kind, "status": event.reported_status,
+         "error": event.reported_error, "evidence_ref": event.evidence_ref}
+        for event in events if event.attempt_id in harness_attempts
     ]
 
     # A next check that names "the failing events" only makes sense when the evidence reports
