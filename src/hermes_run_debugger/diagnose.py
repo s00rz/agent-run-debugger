@@ -525,6 +525,8 @@ def _hypothesise(diagnosis: Diagnosis, events: Sequence[Event], timeline: Timeli
     repeated_tool = [event for event in tool_events if event.reported_status == "failed" and event.name]
     groups: dict[tuple[str, str, str], list[Event]] = {}
     for event in repeated_tool:
+        if event.arguments_ref and event.arguments_ref.startswith("lossy:"):
+            continue
         if event.arguments_ref:
             identity = event.arguments_ref
         elif event.reported_error and event.name not in {"tool_call", "execute_code", "terminal"}:
@@ -686,7 +688,9 @@ def _same_operation(event: Event, failed: Event) -> bool:
         return False
     if failed.span_id is not None and event.span_id == failed.span_id:
         return True
-    if failed.arguments_ref and event.arguments_ref:
+    if (failed.arguments_ref and event.arguments_ref
+            and not failed.arguments_ref.startswith("lossy:")
+            and not event.arguments_ref.startswith("lossy:")):
         return event.arguments_ref == failed.arguments_ref
     if failed.span_id is not None or event.span_id is not None:
         return False
@@ -711,7 +715,9 @@ def _action_chains(events: Sequence[Event]) -> list[dict[str, Any]]:
         successor = recovered or next(iter(later), None)
         if recovered:
             follow_through = "same operation has a later reported success; task correctness remains separate"
-        elif successor and failed.arguments_ref and successor.arguments_ref:
+        elif (successor and failed.arguments_ref and successor.arguments_ref
+              and not failed.arguments_ref.startswith("lossy:")
+              and not successor.arguments_ref.startswith("lossy:")):
             if failed.arguments_ref == successor.arguments_ref:
                 follow_through = "unchanged request failed again; no later matching success recorded"
             else:

@@ -157,7 +157,10 @@ def _shape(path: Path, record: dict[str, Any]) -> str:
             _refuse("shape", "completed execution receipt requires an integer exit")
         return "execution"
     # Numbered adapter receipts have their own maintained schema (e.g. clone).
-    if schema is not None and (schema != "cauldron-uat-clone/v1" or not _NUMBERED.fullmatch(path.name)):
+    adapter_schemas = {
+        "cauldron-uat-clone/v1", "cauldron-uat-clone-readback/v1", "cauldron-uat-operational/v1",
+    }
+    if schema is not None and (schema not in adapter_schemas or not _NUMBERED.fullmatch(path.name)):
         _refuse("format", "unsupported Cauldron receipt schema/version")
     if path.name in {"verdict.json", "golden-verdict.json"}:
         if not _member(record.get("verdict"), _VERDICTS) or not isinstance(record.get("run_id"), str):

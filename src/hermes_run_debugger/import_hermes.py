@@ -209,7 +209,12 @@ def _operation(call: Mapping[str, Any]) -> tuple[str | None, str | None]:
     if arguments is None:
         return name, None
     redacted, _ = redact_record(arguments, stage="pre-store")
-    return name, redacted_content_ref(redacted)
+    reference = redacted_content_ref(redacted)
+    # Redaction can collapse distinct requests. Keep the safe reference useful
+    # for navigation, but never advertise that lossy equality as exact identity.
+    if redacted != arguments:
+        reference = "lossy:" + reference
+    return name, reference
 
 
 def _reported_outcome(record: Mapping[str, Any]) -> str:
