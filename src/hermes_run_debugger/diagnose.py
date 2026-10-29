@@ -688,6 +688,9 @@ def _same_operation(event: Event, failed: Event) -> bool:
         return False
     if failed.span_id is not None and event.span_id == failed.span_id:
         return True
+    if ((failed.arguments_ref or "").startswith("lossy:")
+            or (event.arguments_ref or "").startswith("lossy:")):
+        return False
     if (failed.arguments_ref and event.arguments_ref
             and not failed.arguments_ref.startswith("lossy:")
             and not event.arguments_ref.startswith("lossy:")):
